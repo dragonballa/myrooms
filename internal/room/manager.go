@@ -1,7 +1,9 @@
 package room
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/docker/cli/opts"
 	dockerTypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	dockerMount "github.com/docker/docker/api/types/mount"
@@ -55,6 +58,7 @@ func (manager *RoomManagerCtx) Config() types.RoomsConfig {
 		Connections:    manager.config.EprMax - manager.config.EprMin + 1,
 		NekoImages:     manager.config.NekoImages,
 		StorageEnabled: manager.config.StorageEnabled,
+		UsesMux:        manager.config.Mux,
 	}
 }
 
@@ -111,73 +115,48 @@ func (manager *RoomManagerCtx) Create(settings types.RoomSettings) (string, erro
 		}
 	}
 
+	containerName := manager.config.InstanceName + "-" + roomName
+
 	//
 	// Allocate ports
 	//
 
-	epr, err := manager.allocatePorts(settings.MaxConnections)
+	portsNeeded := settings.MaxConnections
+	if manager.config.Mux {
+		portsNeeded = 1
+	}
+
+	epr, err := manager.allocatePorts(portsNeeded)
 	if err != nil {
 		return "", err
 	}
 
 	portBindings := nat.PortMap{}
-	exposedPorts := nat.PortSet{
-		nat.Port(fmt.Sprintf("%d/tcp", frontendPort)): struct{}{},
-	}
-
 	for port := epr.Min; port <= epr.Max; port++ {
-		portKey := nat.Port(fmt.Sprintf("%d/udp", port))
-
-		portBindings[portKey] = []nat.PortBinding{
+		portBindings[nat.Port(fmt.Sprintf("%d/udp", port))] = []nat.PortBinding{
 			{
 				HostIP:   "0.0.0.0",
 				HostPort: fmt.Sprintf("%d", port),
 			},
 		}
 
-		exposedPorts[portKey] = struct{}{}
-	}
-
-	//
-	// Set traefik labels
-	//
-
-	containerName := manager.config.InstanceName + "-" + roomName
-	pathPrefix := path.Join("/", manager.config.PathPrefix, roomName)
-
-	// create traefik rule
-	traefikRule := "PathPrefix(`" + pathPrefix + "`)"
-	if manager.config.TraefikDomain != "" && manager.config.TraefikDomain != "*" {
-		// match *.domain.tld as subdomain
-		if strings.HasPrefix(manager.config.TraefikDomain, "*.") {
-			traefikRule = fmt.Sprintf(
-				"Host(`%s.%s`)",
-				roomName,
-				strings.TrimPrefix(manager.config.TraefikDomain, "*."),
-			)
-		} else {
-			traefikRule += " && Host(`" + manager.config.TraefikDomain + "`)"
+		// expose TCP port as well when using mux
+		if manager.config.Mux {
+			portBindings[nat.Port(fmt.Sprintf("%d/tcp", port))] = []nat.PortBinding{
+				{
+					HostIP:   "0.0.0.0",
+					HostPort: fmt.Sprintf("%d", port),
+				},
+			}
 		}
-	} else {
-		traefikRule += " && HostRegexp(`{host:.+}`)"
 	}
 
-	traefikLabels := map[string]string{
-		"traefik.enable": "true",
-		"traefik.http.services." + containerName + "-frontend.loadbalancer.server.port": fmt.Sprintf("%d", frontendPort),
-		"traefik.http.routers." + containerName + ".entrypoints":                        manager.config.TraefikEntrypoint,
-		"traefik.http.routers." + containerName + ".rule":                               traefikRule,
-		"traefik.http.middlewares." + containerName + "-rdr.redirectregex.regex":        pathPrefix + "$$",
-		"traefik.http.middlewares." + containerName + "-rdr.redirectregex.replacement":  pathPrefix + "/",
-		"traefik.http.middlewares." + containerName + "-prf.stripprefix.prefixes":       pathPrefix + "/",
-		"traefik.http.routers." + containerName + ".middlewares":                        containerName + "-rdr," + containerName + "-prf",
-		"traefik.http.routers." + containerName + ".service":                            containerName + "-frontend",
+	exposedPorts := nat.PortSet{
+		nat.Port(fmt.Sprintf("%d/tcp", frontendPort)): struct{}{},
 	}
 
-	// optional HTTPS
-	if manager.config.TraefikCertresolver != "" {
-		traefikLabels["traefik.http.routers."+containerName+".tls"] = "true"
-		traefikLabels["traefik.http.routers."+containerName+".tls.certresolver"] = manager.config.TraefikCertresolver
+	for port := range portBindings {
+		exposedPorts[port] = struct{}{}
 	}
 
 	//
@@ -194,15 +173,56 @@ func (manager *RoomManagerCtx) Create(settings types.RoomSettings) (string, erro
 
 	labels := manager.serializeLabels(RoomLabels{
 		Name:      roomName,
-		URL:       manager.config.GetRoomUrl(roomName),
+		Mux:       manager.config.Mux,
 		Epr:       epr,
 		NekoImage: settings.NekoImage,
 
 		BrowserPolicy: browserPolicyLabels,
 	})
 
-	for k, v := range traefikLabels {
-		labels[k] = v
+	//
+	// Set traefik labels
+	//
+
+	pathPrefix := path.Join("/", manager.config.PathPrefix, roomName)
+
+	if t := manager.config.Traefik; t.Enabled {
+		// create traefik rule
+		traefikRule := "PathPrefix(`" + pathPrefix + "`)"
+		if t.Domain != "" && t.Domain != "*" {
+			// match *.domain.tld as subdomain
+			if strings.HasPrefix(t.Domain, "*.") {
+				traefikRule = fmt.Sprintf(
+					"Host(`%s.%s`)",
+					roomName,
+					strings.TrimPrefix(t.Domain, "*."),
+				)
+			} else {
+				traefikRule += " && Host(`" + t.Domain + "`)"
+			}
+		} else {
+			traefikRule += " && HostRegexp(`{host:.+}`)"
+		}
+
+		labels["traefik.enable"] = "true"
+		labels["traefik.http.services."+containerName+"-frontend.loadbalancer.server.port"] = fmt.Sprintf("%d", frontendPort)
+		labels["traefik.http.routers."+containerName+".entrypoints"] = t.Entrypoint
+		labels["traefik.http.routers."+containerName+".rule"] = traefikRule
+		labels["traefik.http.middlewares."+containerName+"-rdr.redirectregex.regex"] = pathPrefix + "$$"
+		labels["traefik.http.middlewares."+containerName+"-rdr.redirectregex.replacement"] = pathPrefix + "/"
+		labels["traefik.http.middlewares."+containerName+"-prf.stripprefix.prefixes"] = pathPrefix + "/"
+		labels["traefik.http.routers."+containerName+".middlewares"] = containerName + "-rdr," + containerName + "-prf"
+		labels["traefik.http.routers."+containerName+".service"] = containerName + "-frontend"
+
+		// optional HTTPS
+		if t.Certresolver != "" {
+			labels["traefik.http.routers."+containerName+".tls"] = "true"
+			labels["traefik.http.routers."+containerName+".tls.certresolver"] = t.Certresolver
+		}
+	} else {
+		labels["m1k1o.neko_rooms.proxy.enabled"] = "true"
+		labels["m1k1o.neko_rooms.proxy.path"] = pathPrefix
+		labels["m1k1o.neko_rooms.proxy.port"] = fmt.Sprintf("%d", frontendPort)
 	}
 
 	// add custom labels
@@ -210,8 +230,11 @@ func (manager *RoomManagerCtx) Create(settings types.RoomSettings) (string, erro
 		// replace dynamic values in labels
 		label = strings.Replace(label, "{containerName}", containerName, -1)
 		label = strings.Replace(label, "{roomName}", roomName, -1)
-		label = strings.Replace(label, "{traefikEntrypoint}", manager.config.TraefikEntrypoint, -1)
-		label = strings.Replace(label, "{traefikCertresolver}", manager.config.TraefikCertresolver, -1)
+
+		if t := manager.config.Traefik; t.Enabled {
+			label = strings.Replace(label, "{traefikEntrypoint}", t.Entrypoint, -1)
+			label = strings.Replace(label, "{traefikCertresolver}", t.Certresolver, -1)
+		}
 
 		v := strings.SplitN(label, "=", 2)
 		if len(v) != 2 {
@@ -227,16 +250,11 @@ func (manager *RoomManagerCtx) Create(settings types.RoomSettings) (string, erro
 	// Set environment variables
 	//
 
-	env := []string{
-		fmt.Sprintf("NEKO_BIND=:%d", frontendPort),
-		fmt.Sprintf("NEKO_EPR=%d-%d", epr.Min, epr.Max),
-		"NEKO_ICELITE=true",
-	}
-
-	// optional nat mapping
-	if len(manager.config.NAT1To1IPs) > 0 {
-		env = append(env, fmt.Sprintf("NEKO_NAT1TO1=%s", strings.Join(manager.config.NAT1To1IPs, ",")))
-	}
+	env := settings.ToEnv(manager.config, types.PortSettings{
+		FrontendPort: frontendPort,
+		EprMin:       epr.Min,
+		EprMax:       epr.Max,
+	})
 
 	//
 	// Set browser policies
@@ -359,6 +377,31 @@ func (manager *RoomManagerCtx) Create(settings types.RoomSettings) (string, erro
 	}
 
 	//
+	// Set container device requests
+	//
+
+	var deviceRequests []container.DeviceRequest
+
+	if len(settings.Resources.Gpus) > 0 {
+		gpuOpts := opts.GpuOpts{}
+
+		// convert to csv
+		var buf bytes.Buffer
+		w := csv.NewWriter(&buf)
+		if err := w.Write(settings.Resources.Gpus); err != nil {
+			return "", err
+		}
+		w.Flush()
+
+		// set GPU opts
+		if err := gpuOpts.Set(buf.String()); err != nil {
+			return "", err
+		}
+
+		deviceRequests = append(deviceRequests, gpuOpts.Value()...)
+	}
+
+	//
 	// Set container configs
 	//
 
@@ -371,7 +414,7 @@ func (manager *RoomManagerCtx) Create(settings types.RoomSettings) (string, erro
 		// List of exposed ports
 		ExposedPorts: exposedPorts,
 		// List of environment variable to set in the container
-		Env: append(env, settings.ToEnv()...),
+		Env: env,
 		// Name of the image as it was passed by the operator (e.g. could be symbolic)
 		Image: settings.NekoImage,
 		// List of labels set to this container
@@ -400,9 +443,10 @@ func (manager *RoomManagerCtx) Create(settings types.RoomSettings) (string, erro
 		Mounts: mounts,
 		// Resources contains container's resources (cgroups config, ulimits...)
 		Resources: container.Resources{
-			CPUShares: settings.Resources.CPUShares,
-			NanoCPUs:  settings.Resources.NanoCPUs,
-			Memory:    settings.Resources.Memory,
+			CPUShares:      settings.Resources.CPUShares,
+			NanoCPUs:       settings.Resources.NanoCPUs,
+			Memory:         settings.Resources.Memory,
+			DeviceRequests: deviceRequests,
 		},
 		// Privileged
 		Privileged: isPrivilegedImage,
@@ -410,7 +454,7 @@ func (manager *RoomManagerCtx) Create(settings types.RoomSettings) (string, erro
 
 	networkingConfig := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{
-			manager.config.TraefikNetwork: {},
+			manager.config.InstanceNetwork: {},
 		},
 	}
 
@@ -526,11 +570,52 @@ func (manager *RoomManagerCtx) GetSettings(id string) (*types.RoomSettings, erro
 
 	var roomResources types.RoomResources
 	if container.HostConfig != nil {
+		gpus := []string{}
+		for _, req := range container.HostConfig.DeviceRequests {
+			var isGpu bool
+			var caps []string
+			for _, cc := range req.Capabilities {
+				for _, c := range cc {
+					if c == "gpu" {
+						isGpu = true
+						continue
+					}
+					caps = append(caps, c)
+				}
+			}
+			if !isGpu {
+				continue
+			}
+
+			if req.Count > 1 {
+				gpus = append(gpus, fmt.Sprintf("count=%d", req.Count))
+			} else if req.Count == -1 {
+				gpus = append(gpus, "all")
+			}
+			if req.Driver != "" {
+				gpus = append(gpus, fmt.Sprintf("driver=%s", req.Driver))
+			}
+			if len(req.DeviceIDs) > 0 {
+				gpus = append(gpus, fmt.Sprintf("device=%s", strings.Join(req.DeviceIDs, ",")))
+			}
+			if len(caps) > 0 {
+				gpus = append(gpus, fmt.Sprintf("capabilities=%s", strings.Join(caps, ",")))
+			}
+			var opts []string
+			for key, val := range req.Options {
+				opts = append(opts, fmt.Sprintf("%s=%s", key, val))
+			}
+			if len(opts) > 0 {
+				gpus = append(gpus, fmt.Sprintf("options=%s", strings.Join(opts, ",")))
+			}
+		}
+
 		roomResources = types.RoomResources{
 			CPUShares: container.HostConfig.CPUShares,
 			NanoCPUs:  container.HostConfig.NanoCPUs,
 			ShmSize:   container.HostConfig.ShmSize,
 			Memory:    container.HostConfig.Memory,
+			Gpus:      gpus,
 		}
 	}
 
@@ -541,6 +626,10 @@ func (manager *RoomManagerCtx) GetSettings(id string) (*types.RoomSettings, erro
 		Mounts:         mounts,
 		BrowserPolicy:  browserPolicy,
 		Resources:      roomResources,
+	}
+
+	if labels.Mux {
+		settings.MaxConnections = 0
 	}
 
 	err = settings.FromEnv(container.Config.Env)

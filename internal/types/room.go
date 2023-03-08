@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/m1k1o/neko-rooms/internal/config"
 	"github.com/m1k1o/neko-rooms/internal/utils"
 )
 
@@ -19,6 +20,8 @@ var blacklistedEnvs = []string{
 	// ignore bunch of envs managed by neko-rooms
 	"NEKO_BIND",
 	"NEKO_EPR",
+	"NEKO_UDPMUX",
+	"NEKO_TCPMUX",
 	"NEKO_NAT1TO1",
 	"NEKO_ICELITE",
 }
@@ -27,6 +30,7 @@ type RoomsConfig struct {
 	Connections    uint16   `json:"connections"`
 	NekoImages     []string `json:"neko_images"`
 	StorageEnabled bool     `json:"storage_enabled"`
+	UsesMux        bool     `json:"uses_mux"`
 }
 
 type RoomEntry struct {
@@ -35,7 +39,7 @@ type RoomEntry struct {
 	Name           string    `json:"name"`
 	NekoImage      string    `json:"neko_image"`
 	IsOutdated     bool      `json:"is_outdated"`
-	MaxConnections uint16    `json:"max_connections"`
+	MaxConnections uint16    `json:"max_connections"` // 0 when using mux
 	Running        bool      `json:"running"`
 	Status         string    `json:"status"`
 	Created        time.Time `json:"created"`
@@ -57,16 +61,17 @@ type RoomMount struct {
 }
 
 type RoomResources struct {
-	CPUShares int64 `json:"cpu_shares"` // relative weight vs. other containers
-	NanoCPUs  int64 `json:"nano_cpus"`  // in units of 10^-9 CPUs
-	ShmSize   int64 `json:"shm_size"`   // in bytes
-	Memory    int64 `json:"memory"`     // in bytes
+	CPUShares int64    `json:"cpu_shares"` // relative weight vs. other containers
+	NanoCPUs  int64    `json:"nano_cpus"`  // in units of 10^-9 CPUs
+	ShmSize   int64    `json:"shm_size"`   // in bytes
+	Memory    int64    `json:"memory"`     // in bytes
+	Gpus      []string `json:"gpus"`       // gpu opts
 }
 
 type RoomSettings struct {
 	Name           string `json:"name"`
 	NekoImage      string `json:"neko_image"`
-	MaxConnections uint16 `json:"max_connections"`
+	MaxConnections uint16 `json:"max_connections"` // 0 when using mux
 
 	ControlProtection bool `json:"control_protection"`
 	ImplicitControl   bool `json:"implicit_control"`
@@ -93,12 +98,37 @@ type RoomSettings struct {
 	BrowserPolicy *BrowserPolicy `json:"browser_policy,omitempty"`
 }
 
-func (settings *RoomSettings) ToEnv() []string {
+type PortSettings struct {
+	FrontendPort   uint16
+	EprMin, EprMax uint16
+}
+
+func (settings *RoomSettings) ToEnv(config *config.Room, ports PortSettings) []string {
 	env := []string{
+		fmt.Sprintf("NEKO_BIND=:%d", ports.FrontendPort),
+		"NEKO_ICELITE=true",
+
+		// from settings
 		fmt.Sprintf("NEKO_PASSWORD=%s", settings.UserPass),
 		fmt.Sprintf("NEKO_PASSWORD_ADMIN=%s", settings.AdminPass),
 		fmt.Sprintf("NEKO_SCREEN=%s", settings.Screen),
 		fmt.Sprintf("NEKO_MAX_FPS=%d", settings.VideoMaxFPS),
+	}
+
+	if config.Mux {
+		env = append(env,
+			fmt.Sprintf("NEKO_UDPMUX=%d", ports.EprMin),
+			fmt.Sprintf("NEKO_TCPMUX=%d", ports.EprMin),
+		)
+	} else {
+		env = append(env,
+			fmt.Sprintf("NEKO_EPR=%d-%d", ports.EprMin, ports.EprMax),
+		)
+	}
+
+	// optional nat mapping
+	if len(config.NAT1To1IPs) > 0 {
+		env = append(env, fmt.Sprintf("NEKO_NAT1TO1=%s", strings.Join(config.NAT1To1IPs, ",")))
 	}
 
 	if settings.ControlProtection {
